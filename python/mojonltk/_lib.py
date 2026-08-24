@@ -20,6 +20,7 @@ _SIGNATURES = {
     "mnltk_jaro_similarity": ([P, P, I, I, P, P], F),
     "mnltk_wordpunct_spans": ([P, I, P], I),
     "mnltk_porter_stem": ([P, I, P, I], I),
+    "mnltk_porter_stem_ascii": ([P, I, I], I),
 }
 
 

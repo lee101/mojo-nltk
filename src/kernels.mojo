@@ -158,29 +158,38 @@ def mnltk_wordpunct_spans(
     return count
 
 
-def ends_with(word: IPtr, n: Int, suffix: StringSlice) -> Bool:
+def ends_with[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]],
+    n: Int,
+    suffix: StringSlice,
+) -> Bool:
     var bytes = suffix.as_bytes()
     if len(bytes) > n:
         return False
     var offset = n - len(bytes)
     for i in range(len(bytes)):
-        if word[offset + i] != Int64(bytes[i]):
+        if word[offset + i] != Scalar[dtype](bytes[i]):
             return False
     return True
 
 
-def replace_suffix(
-    word: IPtr, n: Int, suffix: StringSlice, replacement: StringSlice
+def replace_suffix[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]],
+    n: Int,
+    suffix: StringSlice,
+    replacement: StringSlice,
 ) -> Int:
     var suffix_bytes = suffix.as_bytes()
     var replacement_bytes = replacement.as_bytes()
     var stem_len = n - len(suffix_bytes)
     for i in range(len(replacement_bytes)):
-        word[stem_len + i] = Int64(replacement_bytes[i])
+        word[stem_len + i] = Scalar[dtype](replacement_bytes[i])
     return stem_len + len(replacement_bytes)
 
 
-def is_consonant(word: IPtr, index: Int) -> Bool:
+def is_consonant[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], index: Int
+) -> Bool:
     var c = word[index]
     if c == 97 or c == 101 or c == 105 or c == 111 or c == 117:
         return False
@@ -201,7 +210,9 @@ def is_consonant(word: IPtr, index: Int) -> Bool:
     return True
 
 
-def measure(word: IPtr, n: Int) -> Int:
+def measure[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int
+) -> Int:
     var result = 0
     var previous_vowel = False
     for i in range(n):
@@ -212,14 +223,18 @@ def measure(word: IPtr, n: Int) -> Int:
     return result
 
 
-def contains_vowel(word: IPtr, n: Int) -> Bool:
+def contains_vowel[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int
+) -> Bool:
     for i in range(n):
         if not is_consonant(word, i):
             return True
     return False
 
 
-def ends_double_consonant(word: IPtr, n: Int) -> Bool:
+def ends_double_consonant[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int
+) -> Bool:
     return (
         n >= 2
         and word[n - 1] == word[n - 2]
@@ -227,7 +242,9 @@ def ends_double_consonant(word: IPtr, n: Int) -> Bool:
     )
 
 
-def ends_cvc(word: IPtr, n: Int, mode: Int) -> Bool:
+def ends_cvc[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int, mode: Int
+) -> Bool:
     if n >= 3:
         var last = word[n - 1]
         if (
@@ -247,7 +264,9 @@ def ends_cvc(word: IPtr, n: Int, mode: Int) -> Bool:
     )
 
 
-def step1a(word: IPtr, n: Int, mode: Int) -> Int:
+def step1a[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int, mode: Int
+) -> Int:
     if mode == 2 and n == 4 and ends_with(word, n, "ies"):
         return replace_suffix(word, n, "ies", "ie")
     if ends_with(word, n, "sses"):
@@ -261,7 +280,9 @@ def step1a(word: IPtr, n: Int, mode: Int) -> Int:
     return n
 
 
-def step1b(word: IPtr, n: Int, mode: Int) -> Int:
+def step1b[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int, mode: Int
+) -> Int:
     if mode == 2 and ends_with(word, n, "ied"):
         if n == 4:
             return replace_suffix(word, n, "ied", "ie")
@@ -279,13 +300,13 @@ def step1b(word: IPtr, n: Int, mode: Int) -> Int:
     else:
         return n
     if ends_with(word, intermediate, "at"):
-        word[intermediate] = 101
+        word[intermediate] = Scalar[dtype](101)
         return intermediate + 1
     if ends_with(word, intermediate, "bl"):
-        word[intermediate] = 101
+        word[intermediate] = Scalar[dtype](101)
         return intermediate + 1
     if ends_with(word, intermediate, "iz"):
-        word[intermediate] = 101
+        word[intermediate] = Scalar[dtype](101)
         return intermediate + 1
     if ends_double_consonant(word, intermediate):
         var last = word[intermediate - 1]
@@ -293,25 +314,30 @@ def step1b(word: IPtr, n: Int, mode: Int) -> Int:
             return intermediate - 1
         return intermediate
     if measure(word, intermediate) == 1 and ends_cvc(word, intermediate, mode):
-        word[intermediate] = 101
+        word[intermediate] = Scalar[dtype](101)
         return intermediate + 1
     return intermediate
 
 
-def step1c(word: IPtr, n: Int, mode: Int) -> Int:
+def step1c[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int, mode: Int
+) -> Int:
     if not ends_with(word, n, "y"):
         return n
     var stem_len = n - 1
     if mode == 2:
         if stem_len > 1 and is_consonant(word, stem_len - 1):
-            word[n - 1] = 105
+            word[n - 1] = Scalar[dtype](105)
     elif contains_vowel(word, stem_len):
-        word[n - 1] = 105
+        word[n - 1] = Scalar[dtype](105)
     return n
 
 
-def positive_rule(
-    word: IPtr, n: Int, suffix: StringSlice, replacement: StringSlice
+def positive_rule[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]],
+    n: Int,
+    suffix: StringSlice,
+    replacement: StringSlice,
 ) -> Int:
     var suffix_len = suffix.byte_length()
     if measure(word, n - suffix_len) > 0:
@@ -319,7 +345,9 @@ def positive_rule(
     return n
 
 
-def step2(word: IPtr, n: Int, mode: Int) -> Int:
+def step2[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int, mode: Int
+) -> Int:
     if mode == 2 and ends_with(word, n, "alli"):
         if measure(word, n - 4) > 0:
             return step2(word, replace_suffix(word, n, "alli", "al"), mode)
@@ -377,7 +405,9 @@ def step2(word: IPtr, n: Int, mode: Int) -> Int:
     return n
 
 
-def step3(word: IPtr, n: Int) -> Int:
+def step3[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int
+) -> Int:
     if ends_with(word, n, "icate"):
         return positive_rule(word, n, "icate", "ic")
     if ends_with(word, n, "ative"):
@@ -395,14 +425,20 @@ def step3(word: IPtr, n: Int) -> Int:
     return n
 
 
-def step4_rule(word: IPtr, n: Int, suffix: StringSlice) -> Int:
+def step4_rule[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]],
+    n: Int,
+    suffix: StringSlice,
+) -> Int:
     var stem_len = n - suffix.byte_length()
     if measure(word, stem_len) > 1:
         return stem_len
     return n
 
 
-def step4(word: IPtr, n: Int) -> Int:
+def step4[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int
+) -> Int:
     if ends_with(word, n, "al"):
         return step4_rule(word, n, "al")
     if ends_with(word, n, "ance"):
@@ -451,7 +487,9 @@ def step4(word: IPtr, n: Int) -> Int:
     return n
 
 
-def step5a(word: IPtr, n: Int, mode: Int) -> Int:
+def step5a[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int, mode: Int
+) -> Int:
     if ends_with(word, n, "e"):
         var stem_len = n - 1
         var m = measure(word, stem_len)
@@ -460,7 +498,9 @@ def step5a(word: IPtr, n: Int, mode: Int) -> Int:
     return n
 
 
-def step5b(word: IPtr, n: Int) -> Int:
+def step5b[dtype: DType](
+    word: UnsafePointer[Scalar[dtype], AnyOrigin[mut=True]], n: Int
+) -> Int:
     if ends_with(word, n, "ll") and measure(word, n - 1) > 1:
         return n - 1
     return n
@@ -475,6 +515,23 @@ def mnltk_porter_stem(
     for i in range(source_len):
         word[i] = source[i]
     var n = source_len
+    n = step1a(word, n, mode)
+    n = step1b(word, n, mode)
+    n = step1c(word, n, mode)
+    n = step2(word, n, mode)
+    n = step3(word, n)
+    n = step4(word, n)
+    n = step5a(word, n, mode)
+    n = step5b(word, n)
+    return n
+
+
+@export("mnltk_porter_stem_ascii")
+def mnltk_porter_stem_ascii(
+    word_addr: Int, word_len: Int, mode: Int
+) abi("C") -> Int:
+    var word = bp(word_addr)
+    var n = word_len
     n = step1a(word, n, mode)
     n = step1b(word, n, mode)
     n = step1c(word, n, mode)

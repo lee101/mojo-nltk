@@ -84,15 +84,18 @@ divided by mojo-nltk time.
 
 | case | mojo-nltk | NLTK | ratio | result |
 |---|---:|---:|---:|---|
-| edit_distance (1,400 x 1,400) | 10.20 ms | 1334.77 ms | 130.89x | faster |
-| Damerau edit_distance (700 x 700) | 3.22 ms | 437.16 ms | 135.89x | faster |
-| jaro_similarity (20,000 chars) | 143.18 ms | 10894.39 ms | 76.09x | faster |
-| PorterStemmer.stem (50,000 words) | 1095.65 ms | 599.73 ms | 0.55x | slower |
-| wordpunct_tokenize (1.1M chars) | 56.79 ms | 74.72 ms | 1.32x | faster |
-| trigrams iterator (300,000 tokens) | 21.69 ms | 56.37 ms | 2.60x | faster |
+| edit_distance (1,400 x 1,400) | 8.06 ms | 1307.08 ms | 162.15x | faster |
+| Damerau edit_distance (700 x 700) | 2.95 ms | 375.26 ms | 127.19x | faster |
+| jaro_similarity (20,000 chars) | 138.88 ms | 8660.84 ms | 62.36x | faster |
+| PorterStemmer.stem (50,000 words) | 128.84 ms | 569.09 ms | 4.42x | faster |
+| wordpunct_tokenize (1.1M chars) | 56.09 ms | 74.22 ms | 1.32x | faster |
+| trigrams iterator (300,000 tokens) | 20.49 ms | 52.84 ms | 2.58x | faster |
 
 ASCII tokenization keeps its NumPy buffers zero-copy across the FFI call and
 materializes the native offset buffer in bulk before constructing substrings.
+ASCII Porter stemming mutates one caller-owned byte buffer in place, avoiding
+per-word NumPy arrays, a native input copy, and code-point result construction;
+Unicode words retain the exact code-point buffer path.
 Unpadded n-grams over common built-in sequence types use a C-level `zip`
 iterator; padded and one-shot iterable inputs retain the general deque path.
 
@@ -100,9 +103,10 @@ No GPU path is provided. The remaining kernels are byte classification,
 ordered dynamic programming, suffix branching, or Python object construction,
 not arithmetic-intense work above roughly two FLOPs per byte. GPU transfers
 would lose here. Token boundaries are stateful and n-gram construction is
-GIL-bound, so neither target has a genuinely large independent region that
-would repay CPU thread-launch overhead. A SIMD tokenizer scan was measured but
-was slower on this short-run workload and was not retained.
+GIL-bound, while Porter words are tiny and branch-heavy, so these targets have
+no genuinely large independent region that would repay CPU thread-launch
+overhead. A SIMD tokenizer scan was measured but was slower on this short-run
+workload and was not retained.
 
 Run the verification and benchmark commands with:
 
@@ -114,18 +118,20 @@ pixi run bench
 
 ## How it works
 
-Four native functions live in one Mojo compilation unit and are exported with
+Five native functions live in one Mojo compilation unit and are exported with
 a C ABI. Python loads the shared object with `ctypes`; checked contiguous NumPy
-buffers cross the boundary as pointers. Python keeps every input and output
-array alive for the synchronous call and owns every allocation, so the shared
-library has no cross-runtime allocator or freeing contract.
+arrays and writable byte buffers cross the boundary as pointers. Python keeps
+every input and output buffer alive for the synchronous call and owns every
+allocation, so the shared library has no cross-runtime allocator or freeing
+contract.
 
 Distance inputs become contiguous `int64` symbol IDs. Mojo fills an `int64`
 row-major dynamic-programming matrix and, for Damerau distance, a caller-owned
 last-seen table. This preserves Python sequence equality and Unicode character
 semantics. Jaro uses two caller-owned `int64` match arrays. Porter stemming
-operates in place on a caller-owned `int64` Unicode code-point buffer; suffix
-rules, measure, vowel handling, and all three upstream modes execute in Mojo.
+operates in place on a caller-owned byte buffer for ASCII and uses caller-owned
+`int64` code-point buffers for Unicode; suffix rules, measure, vowel handling,
+and all three upstream modes execute in Mojo.
 
 Word-punctuation tokenization scans ASCII text in Mojo and returns `(start,
 end)` offsets in an `int64` array. Unicode text uses Python's Unicode regular

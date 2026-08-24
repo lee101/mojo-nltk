@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import re
 
 import numpy as np
@@ -44,6 +45,10 @@ class PorterStemmer:
                 "PorterStemmer.ORIGINAL_ALGORITHM"
             )
         self.mode = mode
+        self._mode_id = self._MODES[mode]
+        native = lib()
+        self._native_stem_ascii = native.mnltk_porter_stem_ascii
+        self._native_stem_unicode = native.mnltk_porter_stem
 
     def stem(self, word, to_lowercase=True):
         stem = word.lower() if to_lowercase else word
@@ -51,18 +56,29 @@ class PorterStemmer:
             return self._IRREGULAR[stem]
         if self.mode != self.ORIGINAL_ALGORITHM and len(word) <= 2:
             return stem
+        if not stem:
+            return stem
+        if stem.isascii():
+            word_buffer = bytearray(stem, "ascii")
+            length = self._native_stem_ascii(
+                ctypes.addressof(ctypes.c_uint8.from_buffer(word_buffer)),
+                len(word_buffer),
+                self._mode_id,
+            )
+            if not 0 <= length <= len(word_buffer):
+                raise RuntimeError(f"native stemmer returned invalid length {length}")
+            return word_buffer[:length].decode("ascii")
         source = np.fromiter(map(ord, stem), dtype=np.int64, count=len(stem))
-        source_buf = source if source.size else np.zeros(1, dtype=np.int64)
         destination = np.empty(max(8, source.size + 8), dtype=np.int64)
-        length = lib().mnltk_porter_stem(
-            address(source_buf, np.int64),
+        length = self._native_stem_unicode(
+            address(source, np.int64),
             source.size,
             address(destination, np.int64, writable=True),
-            self._MODES[self.mode],
+            self._mode_id,
         )
         if not 0 <= length <= destination.size:
             raise RuntimeError(f"native stemmer returned invalid length {length}")
-        return "".join(chr(int(codepoint)) for codepoint in destination[:length])
+        return "".join(map(chr, destination[:length].tolist()))
 
     def __repr__(self):
         return "<PorterStemmer>"

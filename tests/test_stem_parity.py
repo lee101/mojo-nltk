@@ -112,6 +112,31 @@ def test_porter_lowercase_flag_and_repr():
     assert repr(ours) == repr(reference)
 
 
+@pytest.mark.parametrize(
+    "word",
+    [
+        "",
+        "y",
+        "by",
+        "é",
+        "éy",
+        "caféed",
+        "naïvely",
+        "東京ing",
+        "sensßïïïing",
+    ],
+)
+def test_porter_ascii_fast_path_and_unicode_edges(word):
+    for mode in (
+        m.PorterStemmer.ORIGINAL_ALGORITHM,
+        m.PorterStemmer.MARTIN_EXTENSIONS,
+        m.PorterStemmer.NLTK_EXTENSIONS,
+    ):
+        ours = m.PorterStemmer(mode)
+        reference = nltk_stem.PorterStemmer(mode)
+        assert ours.stem(word) == reference.stem(word)
+
+
 def test_porter_rejects_unknown_mode():
     with pytest.raises(ValueError, match="Mode must be one of"):
         m.PorterStemmer("fast")
@@ -125,4 +150,3 @@ def test_regexp_stemmer_matches_nltk():
         reference.stem(word) for word in words
     ]
     assert repr(ours) == repr(reference)
-
