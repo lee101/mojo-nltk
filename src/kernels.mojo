@@ -12,10 +12,17 @@ def bp(addr: Int) -> BPtr:
     return BPtr(unsafe_from_address=addr)
 
 
-def min4(a: Int, b: Int, c: Int, d: Int) -> Int:
-    return min(min(a, b), min(c, d))
+comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 
 
+def fp(addr: Int) -> FPtr:
+    return FPtr(unsafe_from_address=addr)
+
+
+# Matches nltk.metrics.distance.edit_distance/_edit_dist_step: the table is a
+# plain int64 array in the same shape as upstream's Python list of rows. The
+# caller proves that no cell can leave int64 before calling (see _fills_int64 in
+# the Python wrapper); anything else recomputes with Python integers there.
 @export("mnltk_edit_distance")
 def mnltk_edit_distance(
     first_addr: Int,
@@ -56,9 +63,42 @@ def mnltk_edit_distance(
                     + i - left + j - right - 1
                 )
             table[i * cols + j] = Int64(
-                min4(deletion, insertion, substitution, transpose)
+                min(deletion, min(insertion, min(substitution, transpose)))
             )
         last[Int(first[i - 1])] = Int64(i)
+    return Int(table[first_len * cols + second_len])
+
+
+# Matches the lev[i][j] table that nltk.metrics.distance.edit_distance_align
+# fills before _edit_dist_backtrace (which stays in Python). Same overflow
+# contract as mnltk_edit_distance.
+@export("mnltk_edit_distance_align")
+def mnltk_edit_distance_align(
+    first_addr: Int,
+    second_addr: Int,
+    first_len: Int,
+    second_len: Int,
+    substitution_cost: Int,
+    table_addr: Int,
+) abi("C") -> Int:
+    var first = ip(first_addr)
+    var second = ip(second_addr)
+    var table = ip(table_addr)
+    var cols = second_len + 1
+    for i in range(first_len + 1):
+        table[i * cols] = Int64(i)
+    for j in range(second_len + 1):
+        table[j] = Int64(j)
+    for i in range(1, first_len + 1):
+        for j in range(1, second_len + 1):
+            var deletion = Int(table[(i - 1) * cols + j]) + 1
+            var insertion = Int(table[i * cols + j - 1]) + 1
+            var substitution = Int(table[(i - 1) * cols + j - 1])
+            if first[i - 1] != second[j - 1]:
+                substitution += substitution_cost
+            table[i * cols + j] = Int64(
+                min(deletion, min(insertion, substitution))
+            )
     return Int(table[first_len * cols + second_len])
 
 
@@ -112,15 +152,26 @@ def mnltk_jaro_similarity(
             i += 1
             j += 1
     var m = Float64(matches)
+    # Same arithmetic order as nltk.metrics.distance.jaro_similarity:
+    # 1/3 * (m/|s1| + m/|s2| + (m - t//2)/m).
     return (
         m / Float64(first_len)
         + m / Float64(second_len)
         + Float64(matches - transpositions // 2) / m
-    ) / 3.0
+    ) * (1.0 / 3.0)
 
 
+# Matches nltk WordPunctTokenizer(r"\w+|[^\w\s]+"): Python re treats 0x1c-0x1f
+# as \s, so they are separators here too.
 def ascii_class(c: UInt8) -> Int:
-    if c == 9 or c == 10 or c == 11 or c == 12 or c == 13 or c == 32:
+    if (
+        c == 9
+        or c == 10
+        or c == 11
+        or c == 12
+        or c == 13
+        or (c >= 28 and c <= 32)
+    ):
         return 0
     if (
         (c >= 48 and c <= 57)
