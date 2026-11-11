@@ -135,14 +135,33 @@ Unicode words retain the exact code-point buffer path.
 Unpadded n-grams over common built-in sequence types use a C-level `zip`
 iterator; padded and one-shot iterable inputs retain the general deque path.
 
-No GPU path is provided. The remaining kernels are byte classification,
-ordered dynamic programming, suffix branching, or Python object construction,
-not arithmetic-intense work above roughly two FLOPs per byte. GPU transfers
-would lose here. Token boundaries are stateful and n-gram construction is
-GIL-bound, while Porter words are tiny and branch-heavy, so these targets have
-no genuinely large independent region that would repay CPU thread-launch
-overhead. A SIMD tokenizer scan was measured but was slower on this short-run
-workload and was not retained.
+No GPU path is provided, and this was decided by the gate in `bench/analysis.md`,
+not by tool availability. `MOJO_NOTES.md` section 5 confirms the host API is
+present on this toolchain (`from max.gpu import block_idx, thread_idx`,
+`from max.gpu.host import DeviceContext`), and `nvidia-smi` reported 5468 MiB
+free on the shared GPU, so the memory gate passed; the per-kernel
+compute-intensity gate did not. Measured `flops/byte` per kernel: Jaro 0.063,
+Levenshtein 0.083, `edit_distance_align` 0.100, Damerau 0.104, Porter about
+0.9. The tokenizer row's nominal 3.0 is an artifact: its denominator is the
+1.05 MB character read, ignoring both the ~5 B touched per character recorded in
+the same analysis (1 B read plus a classification write) and 16.8 MB of span
+bytes, which brings it to about 0.18. None of these reaches roughly 2 flops per
+byte, and the only rows that even approach it are latency-bound (serial DP
+recurrence, scalar Jaro scan) or object-bound (tokenizer Python glue), where a
+copy-in/copy-out would dominate the transfer. Device allocations are therefore
+not used and stay well under the 2 GB cap.
+
+No GPU tests were added, so no GPU tests were skipped; the full suite runs on
+the CPU-only path. No GPU before/after numbers are recorded because no GPU code
+was written, and none are invented here.
+
+The kernels themselves are byte classification,
+ordered dynamic programming, suffix branching, or Python object construction.
+Token boundaries are stateful and n-gram construction is GIL-bound, while Porter
+words are tiny and branch-heavy, so these targets have no genuinely large
+independent region that would repay a host-to-device transfer. A SIMD tokenizer
+scan was measured but was slower on this short-run workload and was not
+retained.
 
 Run the verification and benchmark commands with:
 
