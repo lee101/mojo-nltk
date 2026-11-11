@@ -19,6 +19,7 @@ _SIGNATURES = {
     "mnltk_edit_distance": ([P, P, I, I, I, I, P, P], I),
     "mnltk_edit_distance_align": ([P, P, I, I, I, P], I),
     "mnltk_jaro_similarity": ([P, P, I, I, P, P], F),
+    "mnltk_jaro_similarity_parallel": ([P, I, I], I),
     "mnltk_wordpunct_spans": ([P, I, P], I),
     "mnltk_porter_stem": ([P, I, P, I], I),
     "mnltk_porter_stem_ascii": ([P, I, I], I),

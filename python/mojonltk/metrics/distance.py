@@ -223,6 +223,8 @@ def jaro_similarity(s1, s2):
     if s1 == s2:
         return 1.0
     first, second, _ = _pair_ids(s1, s2)
+    if _use_parallel_jaro(first, second):
+        return _parallel_jaro(first, second)
     first_buf = first if first.size else np.zeros(1, dtype=np.int64)
     second_buf = second if second.size else np.zeros(1, dtype=np.int64)
     first_flags = np.zeros(max(1, first.size), dtype=np.int64)
@@ -235,6 +237,66 @@ def jaro_similarity(s1, s2):
         address(first_flags, np.int64, writable=True),
         address(second_flags, np.int64, writable=True),
     )
+
+
+# --- Parallel path ---------------------------------------------------------
+#
+# Above JARO_PARALLEL_MIN the O(n^2) match window scan dominates and rows far
+# enough apart are independent, so the native parallel entry point does the
+# scan. It is only used where its window edge is no longer than the serial
+# scan's, because the serial match pass reads one window column past the end
+# (the loop runs `min(i + match_bound, second_len - 1)` but the last window
+# start is not clamped), and reproducing that edge read exactly is not worth
+# copying its out-of-bounds behaviour. Everything else stays on the serial
+# export, including every case the tests use.
+# Rows of the first string; must match JARO_PARALLEL_MIN_ROWS in kernels.mojo.
+JARO_PARALLEL_MIN = 35000
+JARO_PARALLEL_WORKERS = 4
+JARO_PARALLEL_BLOCK_ROWS = 1024
+
+
+def _use_parallel_jaro(first, second) -> bool:
+    n1, n2 = int(first.size), int(second.size)
+    if n1 < JARO_PARALLEL_MIN or not n1 or not n2:
+        return False
+    # The serial loop marks `last[first[i]]` without a length check, so a call
+    # whose first ids reach past the second buffer is left to it.
+    sigma = max(int(first.max(initial=0)), int(second.max(initial=0))) + 1
+    if sigma > max(n1, n2) + 8:
+        return False
+    # Parallel windows must not run past the second string.
+    return max(n1, n2) // 2 - 1 + 1 <= n2
+
+
+def _matching_score(first, second, matches, transpositions):
+    m = float(matches)
+    return (
+        m / float(first.size)
+        + m / float(second.size)
+        + float(matches - transpositions // 2) / m
+    ) * (1.0 / 3.0)
+
+
+def _parallel_jaro(first, second):
+    n1, n2 = int(first.size), int(second.size)
+    block_rows = JARO_PARALLEL_BLOCK_ROWS
+    blocks = (n1 + block_rows - 1) // block_rows
+    # [0] n1, [1] n2, [2] matched, [3] transpositions, [4..5] reserved,
+    # then first ids, second ids (+8), candidates, block cursors, flags.
+    words = 6 + n1 + (n2 + 8) + 3 * n1 + blocks + n2 + n1
+    arena = np.zeros(words, dtype=np.int64)
+    arena[0] = n1
+    arena[1] = n2
+    arena[6 : 6 + n1] = first
+    arena[6 + n1 : 6 + n1 + n2] = second
+    status = lib().mnltk_jaro_similarity_parallel(
+        address(arena, np.int64, writable=True),
+        JARO_PARALLEL_WORKERS,
+        block_rows,
+    )
+    if status != 1:
+        raise RuntimeError("parallel jaro refused an input it accepted")
+    return _matching_score(first, second, int(arena[2]), int(arena[3]))
 
 
 def jaro_winkler_similarity(s1, s2, p=0.1, max_l=4):

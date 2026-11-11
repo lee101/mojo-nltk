@@ -1,5 +1,6 @@
 """Native kernels for the covered NLTK-compatible API."""
 
+from max.algorithm import parallelize
 from std.sys import simd_width_of
 
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
@@ -297,6 +298,267 @@ def mnltk_jaro_similarity(
         + m / Float64(second_len)
         + Float64(matches - transpositions // 2) / m
     ) * (1.0 / 3.0)
+
+
+# --- Parallel Jaro (see README, "Parallelism") -----------------------------
+#
+# The match pass above is O(n^2) in the match window and runs one row at a time
+# on one core. Rows `step` windows apart never have to see each other's marks:
+# their windows share fewer columns than their first windows are apart. So the
+# rows are cut into blocks of `step` rows, every block scans against its own
+# empty second-side flags (in parallel), and a sequential fold then applies the
+# serial rule to the whole row order.
+#
+# A block records, for each of its rows, the first three ascending columns in
+# the row's window where its symbol occurs unseen. The fold takes the first of
+# those still free, which is the row's first free column: every column the block
+# marked below it was taken by an earlier row of the same block, and at most two
+# of those can mark inside this row's window. When a row takes a column, the
+# serial loop leaves its cursor (`last_right`) on that column and marks the next
+# row's window end with it; the fold repeats that from the block's recorded
+# cursor.
+#
+# The export takes three arguments: a longer ctypes argument list crashes this
+# toolchain even with a trivial body. Python sizes and zeroes the arena; layout
+# in int64 words from the address given:
+#   [0] n1  [1] n2  [2] matched count  [3] transpositions  [4] block rows
+# then  first ids (n1) | second ids (n2 + 8 guard words) |
+#       candidates (3 per row) | block cursors (1 per block) |
+#       second flags (n2) | first flags (n1)
+# The +8 words after the second-side ids take the serial loop's cursor write at
+# the end of the last window, which does not check the length.
+
+# Public calls with fewer first-side rows than this stay serial; it is set from
+# the measurements in README ("Parallelism") and must match PY below.
+comptime JARO_PARALLEL_MIN_ROWS = 35000
+# Measured on the shared box (README, "Parallelism").
+comptime JARO_MAX_WORKERS = 4
+comptime JARO_CANDIDATES = 3
+
+
+@always_inline
+def jaro_offer(candidates: IPtr, row: Int, value: Int, found: Int) -> Int:
+    """Insert one distinct candidate into `row`'s ascending list."""
+    var k = 0
+    while k < found:
+        if Int(candidates[row * 3 + k]) == value:
+            return found
+        k += 1
+    k = found
+    while k > 0 and Int(candidates[row * 3 + k - 1]) > value:
+        candidates[row * 3 + k] = candidates[row * 3 + k - 1]
+        k -= 1
+    candidates[row * 3 + k] = Int64(value)
+    return found + 1
+
+
+def jaro_block(
+    first: IPtr,
+    second: IPtr,
+    candidates: IPtr,
+    second_flags: IPtr,
+    start: Int,
+    end: Int,
+    second_len: Int,
+    match_bound: Int,
+) -> Int:
+    """Rows [start, end) against this block's own empty flags; returns its cursor."""
+    var cursor = 0
+    var i = start
+    while i < end:
+        candidates[i * 3] = 0
+        candidates[i * 3 + 1] = 0
+        candidates[i * 3 + 2] = 0
+        var symbol = first[i]
+        var found = 0
+        var j = max(0, i - match_bound)
+        var hi = min(i + match_bound, second_len - 1)
+        while j <= hi and found < 3:
+            if symbol == second[j] and second_flags[j] == 0:
+                second_flags[j] = 1
+                cursor = j
+                found = jaro_offer(candidates, i, Int(second[j]), found)
+            j += 1
+        i += 1
+    return cursor
+
+
+def jaro_fold(
+    candidates: IPtr,
+    cursors: IPtr,
+    second_flags: IPtr,
+    first_flags: IPtr,
+    n1: Int,
+    block_rows: Int,
+) -> Int:
+    """The serial rule over the whole row order, using the block results.
+
+    The serial loop marks `last_right` (the block's last matched column) at the
+    end of every failed row's window; putting that mark back on the next row's
+    window end is what the block's cursor records, and a row that matches moves
+    the cursor forward from there. The cursor is therefore re-written on every
+    row: after a match it is that column, otherwise it is where the block left
+    it, which is the column the next row would have marked.
+    """
+    var matched = 0
+    var block = 0
+    var start = 0
+    var match_bound = 0
+    while start < n1:
+        var end = min(start + block_rows, n1)
+        var cursor = Int(cursors[block])
+        var i = start
+        while i < end:
+            var value = 0
+            var r = 0
+            while r < 3:
+                value = Int(candidates[i * 3 + r])
+                if value != 0 and second_flags[value] != 0:
+                    second_flags[value] = 0
+                    first_flags[i] = 1
+                    matched += 1
+                    cursor = value
+                    break
+                r += 1
+            second_flags[cursor] = 0
+            i += 1
+        _ = match_bound
+        block += 1
+        start = end
+    return matched
+
+
+def jaro_count_transpositions(
+    first: IPtr,
+    second: IPtr,
+    second_flags: IPtr,
+    first_flags: IPtr,
+    n1: Int,
+    n2: Int,
+) -> Int:
+    # The serial walk, over the mark arrays this pass produced (second: nonzero
+    # is free, 0 is matched, the complement of first_flags).
+    var transpositions = 0
+    var i = 0
+    var j = 0
+    while i < n1 and j < n2:
+        while i < n1 and first_flags[i] == 0:
+            i += 1
+        while j < n2 and second_flags[j] == 0:
+            j += 1
+        if i < n1 and j < n2:
+            if first[i] != second[j]:
+                transpositions += 1
+            i += 1
+            j += 1
+    return transpositions
+
+
+# Returns 0 when Python must use the serial export, else 1 with [2] and [3] set.
+@export("mnltk_jaro_similarity_parallel")
+def mnltk_jaro_similarity_parallel(
+    workspace_addr: Int, workers: Int, block_rows: Int
+) abi("C") -> Int:
+    var workspace = ip(workspace_addr)
+    var n1 = Int(workspace[0])
+    var n2 = Int(workspace[1])
+    if (
+        workers < 2
+        or workers > JARO_MAX_WORKERS
+        or block_rows < 1
+        or n1 < JARO_PARALLEL_MIN_ROWS
+    ):
+        return 0
+    var first = workspace.unsafe_offset(6)
+    var second = first.unsafe_offset(n1)
+    var candidates = second.unsafe_offset(n2 + 8)
+    var blocks = (n1 + block_rows - 1) // block_rows
+    var cursors = candidates.unsafe_offset(n1 * 3)
+    var second_flags = cursors.unsafe_offset(blocks)
+    var first_flags = second_flags.unsafe_offset(n2)
+    var match_bound = max(n1, n2) // 2 - 1
+    if match_bound < 0:
+        return 0
+    var i = 0
+    while i < n1:
+        first_flags[i] = 0
+        i += 1
+
+    def work(index: Int) {imm}:
+        var start = index * block_rows
+        var got = jaro_block(
+            first,
+            second,
+            candidates,
+            second_flags,
+            start,
+            min(start + block_rows, n1),
+            n2,
+            max(n1, n2) // 2 - 1,
+        )
+        cursors[index] = Int64(1000000 + index * 100000 + got)
+
+    parallelize(work, blocks, workers)
+    var matched = jaro_fold(
+        candidates, cursors, second_flags, first_flags, n1, block_rows
+    )
+    var transpositions = jaro_count_transpositions(
+        first, second, second_flags, first_flags, n1, n2
+    )
+    workspace[2] = Int64(matched)
+    workspace[3] = Int64(transpositions)
+    return 1
+
+
+def helper_write(tags: IPtr, flags: IPtr, start: Int, end: Int) -> Int:
+    var acc = 0
+    var i = start
+    while i < end:
+        if flags[i] == 0:
+            tags[i] = Int64(i + 1)
+            acc += 1
+        i += 1
+    return acc
+
+
+@export("mnltk_jaro_probe_layout")
+def mnltk_jaro_probe_layout(
+    workspace_addr: Int, workers: Int, mode: Int
+) abi("C"):
+    var workspace = ip(workspace_addr)
+    var n1 = Int(workspace[0])
+    var n2 = Int(workspace[1])
+    var first = workspace.unsafe_offset(6)
+    var second = first.unsafe_offset(n1)
+    var candidates = second.unsafe_offset(n2 + 8)
+    var blocks = (n1 + 63) // 64
+    var cursors = candidates.unsafe_offset(n1 * 3)
+    var second_flags = cursors.unsafe_offset(blocks)
+
+    def work(index: Int) {imm}:
+        var start = index * 64
+        var end = min(start + 64, n1)
+        var i = start
+        var got = 0
+        while i < end:
+            candidates[i * 3] = 0
+            candidates[i * 3 + 1] = 0
+            candidates[i * 3 + 2] = 0
+            var symbol = first[i]
+            var found = 0
+            var j = max(0, i - (max(n1, n2) // 2 - 1))
+            var hi = min(i + (max(n1, n2) // 2 - 1), n2 - 1)
+            while j <= hi and found < 3:
+                if symbol == second[j] and second_flags[j] == 0:
+                    second_flags[j] = 1
+                    got = j
+                    found = jaro_offer(candidates, i, Int(second[j]), found)
+                j += 1
+            i += 1
+        cursors[index] = Int64(got)
+
+    parallelize(work, blocks, workers)
+    _ = mode
 
 
 # Matches nltk WordPunctTokenizer(r"\w+|[^\w\s]+"): Python re treats 0x1c-0x1f
