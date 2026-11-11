@@ -90,15 +90,31 @@ def mnltk_edit_distance_align(
     for j in range(second_len + 1):
         table[j] = Int64(j)
     for i in range(1, first_len + 1):
-        for j in range(1, second_len + 1):
-            var deletion = Int(table[(i - 1) * cols + j]) + 1
-            var insertion = Int(table[i * cols + j - 1]) + 1
-            var substitution = Int(table[(i - 1) * cols + j - 1])
-            if first[i - 1] != second[j - 1]:
+        var previous = (i - 1) * cols
+        var current = i * cols
+        var row_char = Int64(first[i - 1])
+        var j = 1
+        while j + 3 <= second_len:
+            comptime for k in range(4):
+                var deletion = Int(table[previous + j + k]) + 1
+                var insertion = Int(table[current + j + k - 1]) + 1
+                var substitution = Int(table[previous + j + k - 1])
+                if row_char != second[j + k - 1]:
+                    substitution += substitution_cost
+                table[current + j + k] = Int64(
+                    min(deletion, min(insertion, substitution))
+                )
+            j += 4
+        while j <= second_len:
+            var deletion = Int(table[previous + j]) + 1
+            var insertion = Int(table[current + j - 1]) + 1
+            var substitution = Int(table[previous + j - 1])
+            if row_char != second[j - 1]:
                 substitution += substitution_cost
-            table[i * cols + j] = Int64(
+            table[current + j] = Int64(
                 min(deletion, min(insertion, substitution))
             )
+            j += 1
     return Int(table[first_len * cols + second_len])
 
 

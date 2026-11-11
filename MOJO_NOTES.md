@@ -69,6 +69,39 @@ while i < n:                           # scalar tail
 - `p.unsafe_load(i)` for a scalar load; `p.unsafe_offset(i)[]` also works.
 - Positional `p[i]` still compiles but warns; prefer `unsafe_load`.
 
+**Compile-time unrolling: `@parameter for` does NOT exist on 1.2.0.** It is a
+parse error: `'for' statement does not support decorators; remove the
+decorator`. The spelling that compiles and unrolls (trip count is a `comptime`,
+the induction variable is a constant inside the body) is **`comptime for`**:
+
+```mojo
+comptime U = 4
+var acc = 0.0
+comptime for k in range(U):     # unrolled; k is a comptime constant
+    var partial = 0.0
+    var i = k
+    while i < n:
+        partial += a.unsafe_load(i) * b.unsafe_load(i)
+        i += U
+    acc += partial
+```
+Verified by building a shared lib and running it on 1.2.0.
+
+What it does NOT support on 1.2.0 (both hit in mojo-nltk and both cost a
+debugging session):
+
+- **`break` inside `comptime for` is not a runtime break.** It compiles, and it
+  is fine when the guarded condition holds for every input, but with a
+  data-dependent condition (early exit on a match) the codegen turns the
+  unrolled body into a state machine and returns wrong results. Compile AND
+  run an early-exit case; do not trust that it built.
+- **`@parameter for` does not exist**, so there is no older spelling to fall
+  back to.
+
+The reliable pattern is unrolling a fixed number of iterations whose bounds the
+enclosing `while` already proved (`while j + 3 <= n` then 4 bodies, then a
+scalar tail), with no `break` in it.
+
 ## 4. Parallelism — moved from `std` to `max`
 
 `parallelize` is NOT gone. It moved package. On 1.2.0:

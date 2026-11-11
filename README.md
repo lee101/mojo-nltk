@@ -82,14 +82,50 @@ NLTK 3.10.0. Times are the best of three warm runs and include
 Python-to-buffer conversion and result construction. The ratio is NLTK time
 divided by mojo-nltk time.
 
-| case | mojo-nltk | NLTK | ratio | result |
-|---|---:|---:|---:|---|
-| edit_distance (1,400 x 1,400) | 8.06 ms | 1307.08 ms | 162.15x | faster |
-| Damerau edit_distance (700 x 700) | 2.95 ms | 375.26 ms | 127.19x | faster |
-| jaro_similarity (20,000 chars) | 138.88 ms | 8660.84 ms | 62.36x | faster |
-| PorterStemmer.stem (50,000 words) | 128.84 ms | 569.09 ms | 4.42x | faster |
-| wordpunct_tokenize (1.1M chars) | 56.09 ms | 74.22 ms | 1.32x | faster |
-| trigrams iterator (300,000 tokens) | 20.49 ms | 52.84 ms | 2.58x | faster |
+| case | before (phase: analyze) | after (phase: unroll) | NLTK | ratio | result |
+|---|---:|---:|---:|---:|---|
+| edit_distance (1,400 x 1,400) | 8.06 ms | 7.58 ms | 1259.71 ms | 166.11x | faster |
+| Damerau edit_distance (700 x 700) | 2.95 ms | 2.93 ms | 371.73 ms | 126.83x | faster |
+| jaro_similarity (20,000 chars) | 138.88 ms | 146.30 ms | 8164.87 ms | 55.81x | faster |
+| PorterStemmer.stem (50,000 words) | 128.84 ms | 112.84 ms | 589.64 ms | 5.23x | faster |
+| wordpunct_tokenize (1.1M chars) | 56.09 ms | 51.78 ms | 76.99 ms | 1.49x | faster |
+| trigrams iterator (300,000 tokens) | 20.49 ms | 21.36 ms | 54.12 ms | 2.53x | faster |
+
+The `before` column is the release-audit `pixi run bench` recorded in the
+phase before this one; it was not re-run. The `after` column and the NLTK and
+ratio columns are one `pixi run bench` on the current code. Three cases are
+Python-bound and outside the kernels this phase touched (Jaro, Porter, and
+trigrams move by run-to-run noise on this shared machine), so the bench table
+alone cannot isolate the kernel change. That is measured separately, by
+interleaving the pre-change and post-change shared libraries on identical
+inputs in one process, median of 6 paired rounds:
+
+| kernel | input | before | after | speedup |
+|---|---|---:|---:|---:|
+| Levenshtein table fill (`mnltk_edit_distance_align`) | 1,400 x 1,400 | 5.16 ms | 3.68 ms | 1.41x |
+| Damerau table fill (`mnltk_edit_distance`) | 700 x 700 | 2.76 ms | 2.75 ms | 1.00x |
+| Jaro match scan | 20,000 chars | 284 ms | 288 ms | 1.00x |
+| word/punct scan | 1,050,000 chars | 4.50 ms | 4.50 ms | 1.00x |
+
+Those four rows and the entry-point figures below are medians over 4-6 such
+sessions on the final binary; the Levenshtein row's best session was 1.44x and
+its worst 1.31x, and the box was shared throughout, so read it as about 1.3-1.4x.
+
+Through the public entry points, with the same Python glue on both sides,
+`edit_distance_align` at 800 x 800 falls from 2.56 to 1.99 ms (1.28x) in the
+final session (4.3 to 3.6 ms, 1.2x, at the bench's own size). Plain
+`edit_distance` at 1,400 x 1,400 measures 1.00-1.03x through the entry point
+even though its kernel is 1.4x faster: the unchanged buffer setup (`_pair_ids`
+plus a 15.7 MB table allocation the kernel then faults in) dominates at that
+size. That gap is Python-layer work and is not addressed in this phase.
+
+Only the Levenshtein table fill changed. Unrolling the Damerau loop measured
+1.00-1.07x and hoisting it 0.93-0.96x, so Damerau keeps its original code; the
+Jaro and tokenizer unrolls changed results or measured at or under 1.00x and
+were reverted whole. The Levenshtein kernel sums integers in the same order as
+NLTK, so its table is bit-identical, not just within tolerance; nothing here
+reorders a floating-point sum, and the existing 1e-15 float tolerance in the
+tests is unchanged.
 
 ASCII tokenization keeps its NumPy buffers zero-copy across the FFI call and
 materializes the native offset buffer in bulk before constructing substrings.
@@ -128,10 +164,13 @@ contract.
 Distance inputs become contiguous `int64` symbol IDs. Mojo fills an `int64`
 row-major dynamic-programming matrix and, for Damerau distance, a caller-owned
 last-seen table. This preserves Python sequence equality and Unicode character
-semantics. Jaro uses two caller-owned `int64` match arrays. Porter stemming
-operates in place on a caller-owned byte buffer for ASCII and uses caller-owned
-`int64` code-point buffers for Unicode; suffix rules, measure, vowel handling,
-and all three upstream modes execute in Mojo.
+semantics. The plain (Levenshtein) fill hoists the two row offsets out of the
+inner loop and evaluates four columns per step with `comptime for`, leaving a
+scalar tail for the last `second_len % 4` columns; the Damerau fill is a plain
+loop because unrolling it did not pay. Jaro uses two caller-owned `int64`
+match arrays. Porter stemming operates in place on a caller-owned byte buffer
+for ASCII and uses caller-owned `int64` code-point buffers for Unicode; suffix
+rules, measure, vowel handling, and all three upstream modes execute in Mojo.
 
 Word-punctuation tokenization scans ASCII text in Mojo and returns `(start,
 end)` offsets in an `int64` array. Unicode text uses Python's Unicode regular
