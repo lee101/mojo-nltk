@@ -1,5 +1,7 @@
 """Native kernels for the covered NLTK-compatible API."""
 
+from std.sys import simd_width_of
+
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 
@@ -69,6 +71,120 @@ def mnltk_edit_distance(
     return Int(table[first_len * cols + second_len])
 
 
+comptime W = simd_width_of[DType.int64]()
+
+# Anti-diagonal fill only above this total length. Below it the table is
+# cache-resident and the wavefront's separate diagonal-2 stream costs more than
+# it saves (see README: it measured slower, so the row fill is kept there).
+comptime WAVE_LIMIT = 200
+
+
+# One W-wide slice of the anti-diagonal i + j = d.
+#
+# Cells on one anti-diagonal are independent: each reads only the diagonal-1
+# (deletion, insertion) and diagonal-2 (substitution) cells. A slice is
+# contiguous in the row-major table because stepping one cell along the
+# diagonal is `+cols - 1`. All values stay in int64 (the caller proved it).
+@no_inline
+def diagonal_block(
+    first: IPtr,
+    second: IPtr,
+    table: IPtr,
+    cols: Int,
+    base: Int,
+    i0: Int,
+    j0: Int,
+    substitution_cost: Int,
+) -> None:
+    # row k of the slice is i0 - k, column k is j0 + k
+    var rows = SIMD[DType.int64, W](0)
+    var columns = SIMD[DType.int64, W](0)
+    comptime for k in range(W):
+        rows[k] = Int64(i0 - k)
+        columns[k] = Int64(j0 + k)
+    var previous = base - cols - 1
+    var deletion = table.load[width=W](previous + 1)
+    var insertion = table.load[width=W](previous + cols)
+    var diagonal = table.load[width=W](previous)
+    var first_symbols = first.load[width=W](i0 - W + 1)
+    var second_symbols = second.load[width=W](j0)
+    # mismatch cost: 0 on equal lanes. `select` takes its first argument on
+    # true lanes; it is the only 0/1-producing comparison path on this
+    # toolchain (Bool SIMD has no cast, `&`/`|` on Bool vectors reduce to one
+    # scalar Bool).
+    var cost = SIMD[DType.int64, W](substitution_cost)
+    var zero = SIMD[DType.int64, W](0)
+    var mismatch = first_symbols.eq(second_symbols).select(zero, cost)
+    var one = SIMD[DType.int64, W](1)
+    var substitution = diagonal + mismatch
+    var transpose = substitution + one
+    var deletion_up = deletion + one
+    var insertion_left = insertion + one
+    var result = min(min(deletion_up, insertion_left), min(substitution, transpose))
+    table.store(base, result)
+
+
+def edit_distance_wavefront(
+    first: IPtr,
+    second: IPtr,
+    table: IPtr,
+    first_len: Int,
+    second_len: Int,
+    cols: Int,
+    substitution_cost: Int,
+) -> None:
+    # Fill the first `split` anti-diagonals W cells at a time, the remaining
+    # (longer than any W slice) ones a row at a time. The cell values are
+    # computed by the same expression in both halves, so the table equals the
+    # plain row-major fill bit for bit.
+    var split = (first_len + second_len) // 2
+    var d = 2
+    while d <= split:
+        var high = min(d - 1, first_len)
+        var low_column = d - high
+        if low_column > second_len:
+            low_column = second_len
+            high = d - low_column
+        var count = min(first_len - high, low_column - 1) + 1
+        var done = 0
+        while done + W <= count:
+            var i = high - done
+            var j = low_column + done
+            diagonal_block(
+                first, second, table, cols, i * cols + j, i, j,
+                substitution_cost,
+            )
+            done += W
+        while done < count:
+            var i = high - done
+            var j = low_column + done
+            var deletion = Int(table[(i - 1) * cols + j]) + 1
+            var insertion = Int(table[i * cols + j - 1]) + 1
+            var substitution = Int(table[(i - 1) * cols + j - 1])
+            if first[i - 1] != second[j - 1]:
+                substitution += substitution_cost
+            table[i * cols + j] = Int64(
+                min(deletion, min(insertion, substitution))
+            )
+            done += 1
+        d += 1
+    for i in range(1, first_len + 1):
+        var previous = (i - 1) * cols
+        var current = i * cols
+        var row_char = Int64(first[i - 1])
+        var j = max(1, split - i + 1)
+        while j <= second_len:
+            var deletion = Int(table[previous + j]) + 1
+            var insertion = Int(table[current + j - 1]) + 1
+            var substitution = Int(table[previous + j - 1])
+            if row_char != second[j - 1]:
+                substitution += substitution_cost
+            table[current + j] = Int64(
+                min(deletion, min(insertion, substitution))
+            )
+            j += 1
+
+
 # Matches the lev[i][j] table that nltk.metrics.distance.edit_distance_align
 # fills before _edit_dist_backtrace (which stays in Python). Same overflow
 # contract as mnltk_edit_distance.
@@ -89,6 +205,12 @@ def mnltk_edit_distance_align(
         table[i * cols] = Int64(i)
     for j in range(second_len + 1):
         table[j] = Int64(j)
+    if first_len >= 2 and second_len >= 2 and first_len + second_len <= WAVE_LIMIT:
+        edit_distance_wavefront(
+            first, second, table, first_len, second_len, cols,
+            substitution_cost,
+        )
+        return Int(table[first_len * cols + second_len])
     for i in range(1, first_len + 1):
         var previous = (i - 1) * cols
         var current = i * cols
